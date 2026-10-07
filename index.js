@@ -3,7 +3,9 @@
 import express from 'express'
 import { chat, parseChatBody } from './chat.js'
 import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createAuthHandlers, createUserStore, loadSecret } from './auth.js'
 import { cors, parseOrigins, rateLimit } from './middleware.js'
 import { AIProviderError, DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, RequestError, createClient, createModelGate, parseRequestBody, recommendWithFallback, withModelFallback } from './recommend.js'
 
@@ -22,6 +24,11 @@ const rateSetting = process.env.RATE_LIMIT_PER_MIN?.trim()
 const RATE_LIMIT = rateSetting && Number.isFinite(Number(rateSetting)) ? Number(rateSetting) : 20
 // Shared by both endpoints: a model that hit its limit is skipped for a while instead of burning more quota.
 const gate = createModelGate()
+// Accounts: users.json (and the generated signing secret) live in AUTH_DATA_DIR, default ./data.
+const dataDir = process.env.AUTH_DATA_DIR?.trim() || fileURLToPath(new URL('./data', import.meta.url))
+const authHandlers = createAuthHandlers({ store: createUserStore(join(dataDir, 'users.json')), secret: loadSecret(process.env.AUTH_SECRET?.trim(), join(dataDir, 'auth-secret.txt')) })
+const authRateSetting = process.env.AUTH_RATE_LIMIT_PER_MIN?.trim()
+const AUTH_RATE_LIMIT = authRateSetting && Number.isFinite(Number(authRateSetting)) ? Number(authRateSetting) : 10
 const apiKey = process.env.GEMINI_API_KEY?.trim()
 // GEMINI_BASE_URL is only for local testing against a mock; leave it unset.
 const client = apiKey ? createClient(apiKey, { baseUrl: process.env.GEMINI_BASE_URL?.trim() || undefined }) : null
@@ -50,11 +57,16 @@ const trustProxy = process.env.TRUST_PROXY?.trim()
 if (trustProxy) app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy)
 app.use(cors(ORIGINS))
 app.use('/api/ai', rateLimit({ limit: RATE_LIMIT }))
+app.use('/api/auth', rateLimit({ limit: AUTH_RATE_LIMIT }))
 app.use(express.json({ limit: '200kb' }))
 
 app.get('/api/health', (_req, res) => {
   res.json({ ok: true, ai: Boolean(client), provider: 'gemini', model: client ? MODEL : null, fallbacks: client ? MODELS.slice(1) : [] })
 })
+
+app.post('/api/auth/signup', authHandlers.signup)
+app.post('/api/auth/login', authHandlers.login)
+app.get('/api/auth/me', authHandlers.me)
 
 app.post('/api/ai/recommend', async (req, res) => {
   if (!client) {
