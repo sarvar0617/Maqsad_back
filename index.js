@@ -5,7 +5,8 @@ import { chat, parseChatBody } from './chat.js'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createAuthHandlers, createUserStore, loadSecret } from './auth.js'
+import pg from 'pg'
+import { createAuthHandlers, createPgUserStore, createUserStore, loadSecret } from './auth.js'
 import { cors, parseOrigins, rateLimit } from './middleware.js'
 import { AIProviderError, DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, RequestError, createClient, createModelGate, parseRequestBody, recommendWithFallback, withModelFallback } from './recommend.js'
 
@@ -24,9 +25,14 @@ const rateSetting = process.env.RATE_LIMIT_PER_MIN?.trim()
 const RATE_LIMIT = rateSetting && Number.isFinite(Number(rateSetting)) ? Number(rateSetting) : 20
 // Shared by both endpoints: a model that hit its limit is skipped for a while instead of burning more quota.
 const gate = createModelGate()
-// Accounts: users.json (and the generated signing secret) live in AUTH_DATA_DIR, default ./data.
+// Accounts: PostgreSQL when DATABASE_URL is set (production); otherwise users.json in AUTH_DATA_DIR (default ./data).
 const dataDir = process.env.AUTH_DATA_DIR?.trim() || fileURLToPath(new URL('./data', import.meta.url))
-const authHandlers = createAuthHandlers({ store: createUserStore(join(dataDir, 'users.json')), secret: loadSecret(process.env.AUTH_SECRET?.trim(), join(dataDir, 'auth-secret.txt')) })
+const DATABASE_URL = process.env.DATABASE_URL?.trim()
+// Render's internal URL needs no SSL; external URLs (other hosts, local tools) do.
+const pool = DATABASE_URL ? new pg.Pool({ connectionString: DATABASE_URL, max: 5, ssl: /\.render\.com|sslmode=require/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined }) : null
+pool?.on('error', (error) => console.error('[db] idle client error:', error.message))
+const userStore = pool ? createPgUserStore(pool) : createUserStore(join(dataDir, 'users.json'))
+const authHandlers = createAuthHandlers({ store: userStore, secret: loadSecret(process.env.AUTH_SECRET?.trim(), join(dataDir, 'auth-secret.txt')) })
 const authRateSetting = process.env.AUTH_RATE_LIMIT_PER_MIN?.trim()
 const AUTH_RATE_LIMIT = authRateSetting && Number.isFinite(Number(authRateSetting)) ? Number(authRateSetting) : 10
 const apiKey = process.env.GEMINI_API_KEY?.trim()
@@ -60,8 +66,10 @@ app.use('/api/ai', rateLimit({ limit: RATE_LIMIT }))
 app.use('/api/auth', rateLimit({ limit: AUTH_RATE_LIMIT }))
 app.use(express.json({ limit: '200kb' }))
 
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, ai: Boolean(client), provider: 'gemini', model: client ? MODEL : null, fallbacks: client ? MODELS.slice(1) : [] })
+app.get('/api/health', async (_req, res) => {
+  let db = 'file'
+  if (pool) db = await pool.query('SELECT 1').then(() => 'ok', () => 'down')
+  res.json({ ok: true, ai: Boolean(client), provider: 'gemini', model: client ? MODEL : null, fallbacks: client ? MODELS.slice(1) : [], db })
 })
 
 app.post('/api/auth/signup', authHandlers.signup)
@@ -122,13 +130,15 @@ app.use((error, _req, res, _next) => {
 const server = app.listen(PORT, HOST, () => {
   console.log(`[api] http://${HOST}:${PORT} - AI ${client ? `enabled (Gemini, ${MODELS.join(' -> ')})` : 'disabled: set GEMINI_API_KEY'}`)
   console.log(`[api] rate limit: ${RATE_LIMIT > 0 ? `${RATE_LIMIT} requests/min per IP on /api/ai` : 'off'}`)
+  console.log(`[api] accounts: ${pool ? 'PostgreSQL (DATABASE_URL)' : `JSON file in ${dataDir}`}`)
+  if (pool) userStore.init().then(() => console.log('[db] users table ready'), (error) => console.error('[db] init failed:', error.message))
   if (!ORIGINS) console.warn('[api] WARNING: CORS_ORIGINS is not set, allowing requests from any origin. Set it to your frontend URL in production.')
 })
 
 // Graceful shutdown: stop accepting connections, let in-flight requests finish, force exit after 10s.
 function shutdown(signal) {
   console.log(`[api] ${signal} received, shutting down`)
-  server.close(() => process.exit(0))
+  server.close(() => (pool ? pool.end() : Promise.resolve()).finally(() => process.exit(0)))
   server.closeIdleConnections()
   setTimeout(() => process.exit(1), 10_000).unref()
 }

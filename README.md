@@ -6,7 +6,10 @@ Express 5 backend for Maqsad. It asks Gemini to explain a routine and powers the
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/api/health` | `{ ok, ai, provider, model, fallbacks }`; `ai:false` when no API key |
+| GET | `/api/health` | `{ ok, ai, provider, model, fallbacks, db }`; `ai:false` when no API key, `db`: `ok` / `down` / `file` |
+| POST | `/api/auth/signup` | `{ name, age, email, password }` → `{ token, user }` |
+| POST | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
+| GET | `/api/auth/me` | `Authorization: Bearer <token>` → `{ user }` |
 | POST | `/api/ai/recommend` | 503 `no_api_key` without a key |
 | POST | `/api/ai/chat` | 503 `no_api_key` without a key |
 
@@ -24,6 +27,8 @@ Express 5 backend for Maqsad. It asks Gemini to explain a routine and powers the
 | `TRUST_PROXY` | unset | Proxy hops in front of the app (Render/Railway: `1`) so the limit sees real client IPs. |
 | `GEMINI_MODEL` | built-in | Main model. |
 | `GEMINI_FALLBACK_MODELS` | built-in | Comma-separated, or `none`. |
+| `DATABASE_URL` | unset | PostgreSQL for accounts (required in production). Unset = `data/users.json`, which is lost on redeploy. |
+| `AUTH_SECRET` | generated | Signs login tokens. Set a long random string in production. |
 
 See `.env.example`. Never commit `.env`.
 
@@ -49,7 +54,7 @@ The chat/recommend bodies must match what the frontend sends (see `chat.js` / `r
 ### Render / Railway (Node)
 1. Push this folder as its own repo.
 2. New Web Service from the repo. Build: `npm ci --omit=dev`. Start: `npm start`.
-3. Set env: `GEMINI_API_KEY`, `CORS_ORIGINS=https://<your-frontend-domain>`, `TRUST_PROXY=1`. Do not set `PORT`.
+3. Set env: `GEMINI_API_KEY`, `CORS_ORIGINS=https://<your-frontend-domain>`, `TRUST_PROXY=1`, `AUTH_SECRET`, and `DATABASE_URL` (the Render Postgres *Internal Database URL*). Do not set `PORT`.
 4. Health check path: `/api/health`.
 
 ### Docker / VPS

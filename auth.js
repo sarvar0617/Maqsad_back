@@ -1,5 +1,6 @@
-// Accounts: sign up (name, age, email, password) and log in (email, password). No extra packages:
-// passwords are hashed with scrypt, sessions are HMAC-signed tokens, users live in a JSON file.
+// Accounts: sign up (name, age, email, password) and log in (email, password).
+// Passwords are hashed with scrypt, sessions are HMAC-signed tokens. Users live in PostgreSQL when
+// DATABASE_URL is set (production), otherwise in a JSON file (local dev) or in memory (tests).
 import { randomBytes, scrypt as scryptCallback, createHmac, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
@@ -97,6 +98,50 @@ export function createUserStore(file) {
   }
 }
 
+// PostgreSQL user store (same interface as createUserStore, but every method returns a promise).
+// `pool` is a pg Pool; the table is created on first use.
+export function createPgUserStore(pool) {
+  const toUser = (row) => row && { id: row.id, name: row.name, age: row.age, email: row.email, passwordHash: row.password_hash, createdAt: row.created_at.toISOString() }
+  let ready
+  const init = () => {
+    ready ??= pool.query(`CREATE TABLE IF NOT EXISTS users (
+      id text PRIMARY KEY,
+      name text NOT NULL,
+      age integer NOT NULL,
+      email text NOT NULL UNIQUE,
+      password_hash text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`).catch((error) => {
+      ready = undefined // retry on the next request instead of failing forever
+      throw error
+    })
+    return ready
+  }
+  return {
+    init,
+    async findByEmail(email) {
+      await init()
+      const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email])
+      return toUser(rows[0]) ?? null
+    },
+    async findById(id) {
+      await init()
+      const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [id])
+      return toUser(rows[0]) ?? null
+    },
+    async add(user) {
+      await init()
+      try {
+        await pool.query('INSERT INTO users (id, name, age, email, password_hash, created_at) VALUES ($1, $2, $3, $4, $5, $6)', [user.id, user.name, user.age, user.email, user.passwordHash, user.createdAt])
+      } catch (error) {
+        // Two sign-ups with the same email at the same moment: the unique index decides.
+        if (error.code === '23505') throw fail('email_taken', 'An account with this email already exists.', 409)
+        throw error
+      }
+    },
+  }
+}
+
 export const publicUser = ({ id, name, age, email }) => ({ id, name, age, email })
 
 // Signing secret: AUTH_SECRET if set, otherwise a random one kept next to the users file.
@@ -124,9 +169,9 @@ export function createAuthHandlers({ store, secret }) {
     async signup(req, res) {
       try {
         const input = parseSignupBody(req.body)
-        if (store.findByEmail(input.email)) throw fail('email_taken', 'An account with this email already exists.', 409)
+        if (await store.findByEmail(input.email)) throw fail('email_taken', 'An account with this email already exists.', 409)
         const user = { id: randomBytes(12).toString('hex'), name: input.name, age: input.age, email: input.email, passwordHash: await hashPassword(input.password), createdAt: new Date().toISOString() }
-        store.add(user)
+        await store.add(user)
         respond(res, user, 201)
       } catch (error) {
         sendError(res, error)
@@ -136,7 +181,7 @@ export function createAuthHandlers({ store, secret }) {
     async login(req, res) {
       try {
         const { email, password } = parseLoginBody(req.body)
-        const user = store.findByEmail(email)
+        const user = await store.findByEmail(email)
         // Hash even for unknown emails so response time does not reveal which emails exist.
         const valid = await verifyPassword(password, user?.passwordHash ?? '00:00').catch(() => false)
         if (!user || !valid) throw fail('invalid_credentials', 'Wrong email or password.', 401)
@@ -146,11 +191,15 @@ export function createAuthHandlers({ store, secret }) {
       }
     },
 
-    me(req, res) {
-      const userId = verifyToken(/^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1], secret)
-      const user = userId && store.findById(userId)
-      if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Please log in again.' })
-      res.json({ user: publicUser(user) })
+    async me(req, res) {
+      try {
+        const userId = verifyToken(/^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1], secret)
+        const user = userId && await store.findById(userId)
+        if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Please log in again.' })
+        res.json({ user: publicUser(user) })
+      } catch (error) {
+        sendError(res, error)
+      }
     },
   }
 }

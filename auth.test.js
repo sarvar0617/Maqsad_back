@@ -67,7 +67,7 @@ describe('auth handlers', () => {
     expect(login.code).toBe(200)
 
     const me = fakeRes()
-    auth.me({ headers: { authorization: `Bearer ${login.body.token}` } }, me)
+    await auth.me({ headers: { authorization: `Bearer ${login.body.token}` } }, me)
     expect(me.body.user.email).toBe('ali@mail.com')
   })
 
@@ -81,9 +81,9 @@ describe('auth handlers', () => {
     }
   })
 
-  it('rejects /me without a valid token', () => {
+  it('rejects /me without a valid token', async () => {
     const res = fakeRes()
-    setup().me({ headers: {} }, res)
+    await setup().me({ headers: {} }, res)
     expect(res.code).toBe(401)
   })
 })
