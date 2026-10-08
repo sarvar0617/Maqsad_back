@@ -146,9 +146,24 @@ const server = app.listen(PORT, HOST, () => {
   if (!ORIGINS) console.warn('[api] WARNING: CORS_ORIGINS is not set, allowing requests from any origin. Set it to your frontend URL in production.')
 })
 
+// Keep-alive for Render's free plan, which spins a service down after 15 minutes without inbound requests.
+// The server calls its own public URL (Render sets RENDER_EXTERNAL_URL), so the request comes back in through
+// Render's proxy and counts as traffic. Off unless KEEP_ALIVE_MINUTES is set (e.g. 10); keep it under 15.
+const keepAliveMinutes = Number(process.env.KEEP_ALIVE_MINUTES)
+const keepAliveUrl = process.env.KEEP_ALIVE_URL?.trim() || process.env.RENDER_EXTERNAL_URL?.trim()
+const keepAlive = keepAliveMinutes > 0 && keepAliveUrl
+  ? setInterval(() => {
+    fetch(new URL('/api/health', keepAliveUrl), { signal: AbortSignal.timeout(30_000) })
+      .then((response) => { if (!response.ok) console.warn(`[keep-alive] /api/health answered ${response.status}`) })
+      .catch((error) => console.warn(`[keep-alive] ping failed: ${error.message}`))
+  }, keepAliveMinutes * 60_000)
+  : null
+if (keepAlive) console.log(`[keep-alive] pinging ${keepAliveUrl}/api/health every ${keepAliveMinutes} min`)
+
 // Graceful shutdown: stop accepting connections, let in-flight requests finish, force exit after 10s.
 function shutdown(signal) {
   console.log(`[api] ${signal} received, shutting down`)
+  if (keepAlive) clearInterval(keepAlive)
   server.close(() => (pool ? pool.end() : Promise.resolve()).finally(() => process.exit(0)))
   server.closeIdleConnections()
   setTimeout(() => process.exit(1), 10_000).unref()

@@ -30,6 +30,7 @@ Express 5 backend for Maqsad. It asks Gemini to explain a routine and powers the
 | `GEMINI_MODEL` | built-in | Main model. |
 | `GEMINI_FALLBACK_MODELS` | built-in | Comma-separated, or `none`. |
 | `DATABASE_URL` | unset | PostgreSQL for accounts (required in production). Unset = `data/users.json`, which is lost on redeploy. |
+| `KEEP_ALIVE_MINUTES` | unset | Render free plan: the server pings its own `RENDER_EXTERNAL_URL` every N minutes (keep < 15) so it never spins down. A 24/7 service uses ~744 of the 750 free hours a month, so keep only one free service awake. |
 | `AUTH_SECRET` | generated | Signs login tokens. Set a long random string in production. |
 
 See `.env.example`. Never commit `.env`.
