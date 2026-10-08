@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { createAuthHandlers, createPgUserStore, createUserStore, loadSecret } from './auth.js'
 import { cors, parseOrigins, rateLimit } from './middleware.js'
+import { createPgPlannerStore, createPlannerHandlers, createPlannerStore } from './planner.js'
 import { AIProviderError, DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, RequestError, createClient, createModelGate, parseRequestBody, recommendWithFallback, withModelFallback } from './recommend.js'
 
 const envFile = fileURLToPath(new URL('./.env', import.meta.url))
@@ -32,7 +33,11 @@ const DATABASE_URL = process.env.DATABASE_URL?.trim()
 const pool = DATABASE_URL ? new pg.Pool({ connectionString: DATABASE_URL, max: 5, ssl: /\.render\.com|sslmode=require/.test(DATABASE_URL) ? { rejectUnauthorized: false } : undefined }) : null
 pool?.on('error', (error) => console.error('[db] idle client error:', error.message))
 const userStore = pool ? createPgUserStore(pool) : createUserStore(join(dataDir, 'users.json'))
-const authHandlers = createAuthHandlers({ store: userStore, secret: loadSecret(process.env.AUTH_SECRET?.trim(), join(dataDir, 'auth-secret.txt')) })
+const authSecret = loadSecret(process.env.AUTH_SECRET?.trim(), join(dataDir, 'auth-secret.txt'))
+const authHandlers = createAuthHandlers({ store: userStore, secret: authSecret })
+// Planner data synced between a user's devices; same storage choice as accounts.
+const plannerStore = pool ? createPgPlannerStore(pool, { ready: () => userStore.init() }) : createPlannerStore(join(dataDir, 'planner.json'))
+const plannerHandlers = createPlannerHandlers({ store: plannerStore, users: userStore, secret: authSecret })
 const authRateSetting = process.env.AUTH_RATE_LIMIT_PER_MIN?.trim()
 const AUTH_RATE_LIMIT = authRateSetting && Number.isFinite(Number(authRateSetting)) ? Number(authRateSetting) : 10
 const apiKey = process.env.GEMINI_API_KEY?.trim()
@@ -64,6 +69,9 @@ if (trustProxy) app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustPr
 app.use(cors(ORIGINS))
 app.use('/api/ai', rateLimit({ limit: RATE_LIMIT }))
 app.use('/api/auth', rateLimit({ limit: AUTH_RATE_LIMIT }))
+app.use('/api/planner', rateLimit({ limit: 120 }))
+// A full planner document (months of routines) is bigger than the other bodies.
+app.use('/api/planner', express.json({ limit: '2mb' }))
 app.use(express.json({ limit: '200kb' }))
 
 app.get('/api/health', async (_req, res) => {
@@ -75,6 +83,9 @@ app.get('/api/health', async (_req, res) => {
 app.post('/api/auth/signup', authHandlers.signup)
 app.post('/api/auth/login', authHandlers.login)
 app.get('/api/auth/me', authHandlers.me)
+
+app.get('/api/planner', plannerHandlers.get)
+app.put('/api/planner', plannerHandlers.put)
 
 app.post('/api/ai/recommend', async (req, res) => {
   if (!client) {
@@ -131,7 +142,7 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`[api] http://${HOST}:${PORT} - AI ${client ? `enabled (Gemini, ${MODELS.join(' -> ')})` : 'disabled: set GEMINI_API_KEY'}`)
   console.log(`[api] rate limit: ${RATE_LIMIT > 0 ? `${RATE_LIMIT} requests/min per IP on /api/ai` : 'off'}`)
   console.log(`[api] accounts: ${pool ? 'PostgreSQL (DATABASE_URL)' : `JSON file in ${dataDir}`}`)
-  if (pool) userStore.init().then(() => console.log('[db] users table ready'), (error) => console.error('[db] init failed:', error.message))
+  if (pool) plannerStore.init().then(() => console.log('[db] users and planner_data tables ready'), (error) => console.error('[db] init failed:', error.message))
   if (!ORIGINS) console.warn('[api] WARNING: CORS_ORIGINS is not set, allowing requests from any origin. Set it to your frontend URL in production.')
 })
 

@@ -14,7 +14,7 @@ export function cors(origins) {
       if (origins) res.vary('Origin')
     }
     if (req.method === 'OPTIONS') {
-      res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+      res.set('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS')
       res.set('Access-Control-Allow-Headers', req.headers['access-control-request-headers'] || 'Content-Type')
       res.set('Access-Control-Max-Age', '86400')
       return res.sendStatus(204)

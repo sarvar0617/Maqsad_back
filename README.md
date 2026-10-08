@@ -10,6 +10,8 @@ Express 5 backend for Maqsad. It asks Gemini to explain a routine and powers the
 | POST | `/api/auth/signup` | `{ name, age, email, password }` → `{ token, user }` |
 | POST | `/api/auth/login` | `{ email, password }` → `{ token, user }` |
 | GET | `/api/auth/me` | `Authorization: Bearer <token>` → `{ user }` |
+| GET | `/api/planner` | Bearer token → `{ data, updatedAt }` (`data: null` for a new account) |
+| PUT | `/api/planner` | Bearer token, `{ data: { weeklySchedule, goals, oneTimeTasks, preferences, routines, progress } }` → `{ updatedAt }` (max 2 MB) |
 | POST | `/api/ai/recommend` | 503 `no_api_key` without a key |
 | POST | `/api/ai/chat` | 503 `no_api_key` without a key |
 
