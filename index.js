@@ -6,7 +6,9 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
-import { createAuthHandlers, createPgUserStore, createUserStore, loadSecret } from './auth.js'
+import { OAuth2Client } from 'google-auth-library'
+import { createAuthHandlers, createPgUserStore, createUserStore, loadSecret, requireVerified } from './auth.js'
+import { createMailer, verificationEmail } from './mailer.js'
 import { cors, parseOrigins, rateLimit } from './middleware.js'
 import { createPgPlannerStore, createPlannerHandlers, createPlannerStore } from './planner.js'
 import { AIProviderError, DEFAULT_FALLBACK_MODELS, DEFAULT_MODEL, RequestError, createClient, createModelGate, parseRequestBody, recommendWithFallback, withModelFallback } from './recommend.js'
@@ -34,7 +36,15 @@ const pool = DATABASE_URL ? new pg.Pool({ connectionString: DATABASE_URL, max: 5
 pool?.on('error', (error) => console.error('[db] idle client error:', error.message))
 const userStore = pool ? createPgUserStore(pool) : createUserStore(join(dataDir, 'users.json'))
 const authSecret = loadSecret(process.env.AUTH_SECRET?.trim(), join(dataDir, 'auth-secret.txt'))
-const authHandlers = createAuthHandlers({ store: userStore, secret: authSecret })
+// E-mail confirmation (Resend) and Google sign-in. Both are optional: without RESEND_API_KEY the link is only
+// logged, without GOOGLE_CLIENT_ID the Google endpoint answers 503.
+const mailer = createMailer({ apiKey: process.env.RESEND_API_KEY?.trim(), from: process.env.MAIL_FROM?.trim() || 'Maqsad <noreply@maqsadai.uz>' })
+const APP_URL = process.env.APP_URL?.trim() || 'http://localhost:5173'
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID?.trim()
+const google = GOOGLE_CLIENT_ID ? { verifier: new OAuth2Client(GOOGLE_CLIENT_ID), clientId: GOOGLE_CLIENT_ID } : null
+const authHandlers = createAuthHandlers({ store: userStore, secret: authSecret, mailer, appUrl: APP_URL, google, emailTemplate: verificationEmail })
+// AI and cross-device sync are for confirmed accounts only.
+const verifiedOnly = requireVerified({ store: userStore, secret: authSecret })
 // Planner data synced between a user's devices; same storage choice as accounts.
 const plannerStore = pool ? createPgPlannerStore(pool, { ready: () => userStore.init() }) : createPlannerStore(join(dataDir, 'planner.json'))
 const plannerHandlers = createPlannerHandlers({ store: plannerStore, users: userStore, secret: authSecret })
@@ -83,11 +93,14 @@ app.get('/api/health', async (_req, res) => {
 app.post('/api/auth/signup', authHandlers.signup)
 app.post('/api/auth/login', authHandlers.login)
 app.get('/api/auth/me', authHandlers.me)
+app.post('/api/auth/google', authHandlers.google)
+app.post('/api/auth/verify-email', authHandlers.verifyEmail)
+app.post('/api/auth/resend-verification', authHandlers.resendVerification)
 
-app.get('/api/planner', plannerHandlers.get)
-app.put('/api/planner', plannerHandlers.put)
+app.get('/api/planner', verifiedOnly, plannerHandlers.get)
+app.put('/api/planner', verifiedOnly, plannerHandlers.put)
 
-app.post('/api/ai/recommend', async (req, res) => {
+app.post('/api/ai/recommend', verifiedOnly, async (req, res) => {
   if (!client) {
     return res.status(503).json({ error: 'no_api_key', message: 'GEMINI_API_KEY is not set on the server.' })
   }
@@ -110,7 +123,7 @@ app.post('/api/ai/recommend', async (req, res) => {
 })
 
 // AI Coach chat (chat.js). The answer only proposes changes; the frontend applies them after the user confirms.
-app.post('/api/ai/chat', async (req, res) => {
+app.post('/api/ai/chat', verifiedOnly, async (req, res) => {
   if (!client) {
     return res.status(503).json({ error: 'no_api_key', message: 'GEMINI_API_KEY is not set on the server.' })
   }
@@ -142,6 +155,7 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`[api] http://${HOST}:${PORT} - AI ${client ? `enabled (Gemini, ${MODELS.join(' -> ')})` : 'disabled: set GEMINI_API_KEY'}`)
   console.log(`[api] rate limit: ${RATE_LIMIT > 0 ? `${RATE_LIMIT} requests/min per IP on /api/ai` : 'off'}`)
   console.log(`[api] accounts: ${pool ? 'PostgreSQL (DATABASE_URL)' : `JSON file in ${dataDir}`}`)
+  console.log(`[api] email confirmation: ${mailer.configured ? 'Resend' : 'not sent (RESEND_API_KEY unset), links are logged'}; Google sign-in: ${google ? 'on' : 'off (GOOGLE_CLIENT_ID unset)'}; links open ${APP_URL}`)
   if (pool) plannerStore.init().then(() => console.log('[db] users and planner_data tables ready'), (error) => console.error('[db] init failed:', error.message))
   if (!ORIGINS) console.warn('[api] WARNING: CORS_ORIGINS is not set, allowing requests from any origin. Set it to your frontend URL in production.')
 })
