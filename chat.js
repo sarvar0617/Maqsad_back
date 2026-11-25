@@ -58,7 +58,8 @@ export const CHAT_SCHEMA = {
     reply: { type: 'string', description: 'Message shown to the user.' },
     actions: {
       type: 'array',
-      maxItems: MAX_ACTIONS,
+      // No maxItems here: a long limit on nested objects makes Gemini reject the schema as too complex.
+      // sanitizeChatAnswer caps the list at MAX_ACTIONS instead.
       items: {
         type: 'object',
         properties: {
