@@ -6,12 +6,19 @@ import { AIProviderError, DEFAULT_MODEL, LANGUAGE_NAMES, RequestError, normalize
 
 export const MAX_MESSAGES = 16
 export const MAX_MESSAGE_CHARS = 2000
-export const MAX_ACTIONS = 5
+// Proposals per answer: a photo of a timetable or a to-do list can hold many items.
+export const MAX_ACTIONS = 15
+export const TEXT_ACTIONS = 5
+// Photo sent with the last user message: base64 data, after the client has scaled it down.
+export const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 const PRIORITIES = ['High', 'Medium', 'Low']
 const UNITS = ['hours', 'sessions', 'pages', 'chapters', 'lessons', 'words']
 const STUDY_TIMES = ['morning', 'afternoon', 'evening']
-const ACTION_TYPES = ['addTask', 'addGoal', 'updatePreferences', 'generateRoutine']
+const ACTION_TYPES = ['addTask', 'addScheduleBlock', 'addGoal', 'updatePreferences', 'generateRoutine']
+const SCHEDULE_TYPES = ['University', 'Work', 'Class', 'Personal']
+const DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
 const BASE_CHAT_PROMPT = `You are "Maqsad Coach", the assistant inside Maqsad, a daily-routine and study planner for students.
 
@@ -26,9 +33,16 @@ ACTIONS — you can propose changes; the app shows each one to the user with App
 - addTask: a one-time task on a specific date with start and end time ("HH:MM", 24h). Only propose it when the user gave (or clearly implied) the day and time; otherwise ask. Choose a slot that does not overlap the fixed schedule or other tasks on that date.
 - addGoal: a long-term learning goal with startDate, endDate ("YYYY-MM-DD"), priority, targetHours (total hours needed, a realistic estimate) and a short description. Ask for the deadline if it is unclear.
 - updatePreferences: change only the fields that should change (wakeTime, sleepTime, preferredStudyTime, breakMinutes, maxSessionMinutes, travelBufferMinutes, mealMinutes).
+- addScheduleBlock: a block that repeats every week (a class, lecture, lab, work shift, regular training) with day (Monday…Sunday), start and end time and type: University for university classes and lectures, Class for courses and tutoring, Work, or Personal. Skip blocks that are already in weeklySchedule (same day and time) and say they are already there; if a block overlaps an existing one, say so in the reply.
 - generateRoutine: propose rebuilding today's routine, typically after other proposals or when the user asks for a new plan.
-Propose at most ${MAX_ACTIONS} actions, and only when they help. For questions and advice, return an empty actions list.
+Propose at most ${TEXT_ACTIONS} actions, and only when they help (up to ${MAX_ACTIONS} when reading a photo, see below). For questions and advice, return an empty actions list.
 Each action needs a short "summary" the user will read on the card (e.g. "Add task: Cleaning, today 19:00–20:00").
+
+PHOTOS — the user may attach a photo of a handwritten or printed to-do list, notes, a timetable or a planner page. Read it carefully, line by line, including crossed-out or ticked items (skip those that are crossed out or ticked as done).
+- In the reply, first list briefly what you read, then what you propose. If some words or times are unreadable, say which and ask instead of guessing.
+- Weekly repeating classes or shifts → addScheduleBlock. Dated or one-off items (deadline, exam, meeting, "Friday 15:00 dentist") → addTask, with the date taken from upcomingDates. A one-off item without a time: ask for the time, or propose a sensible free slot and say you chose it. Long-term aims ("learn English by June") → addGoal.
+- Use the user's own words for titles (keep the original language), and fix obvious spelling only.
+- If the photo has nothing to do with planning, say so politely and propose nothing.
 
 STYLE — reply in the same language the user writes in (Uzbek, Russian or English). When the language of the user's message is unclear (e.g. just "ok", "yes", a number, a time or an emoji), reply in {DEFAULT_LANGUAGE}, the language the user chose in the app; write proposal summaries in the language of your reply. Be warm, concrete and short: usually 2–5 sentences, simple lists when useful, no markdown headings or tables.`
 
@@ -50,6 +64,17 @@ export const CHAT_SCHEMA = {
         properties: {
           type: { type: 'string', enum: ACTION_TYPES },
           summary: { type: 'string', description: 'One short line shown on the proposal card.' },
+          scheduleBlock: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              day: { type: 'string', enum: DAY_NAMES },
+              startTime: { type: 'string', description: 'HH:MM, 24h' },
+              endTime: { type: 'string', description: 'HH:MM, 24h' },
+              type: { type: 'string', enum: SCHEDULE_TYPES },
+            },
+            required: ['title', 'day', 'startTime', 'endTime', 'type'],
+          },
           task: {
             type: 'object',
             properties: {
@@ -87,7 +112,7 @@ export const CHAT_SCHEMA = {
             },
           },
         },
-        // task / goal / preferences: fill only the one matching `type`.
+        // task / scheduleBlock / goal / preferences: fill only the one matching `type`.
         required: ['type', 'summary'],
       },
     },
@@ -100,7 +125,19 @@ const isDate = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.tes
 const isTime = (value) => typeof value === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(value)
 const cleanText = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '')
 
-// Accepts { messages: [{ role: 'user'|'assistant', text }], context, language? }; throws RequestError when malformed.
+function parseImage(image) {
+  if (image === undefined || image === null) return null
+  if (!isObject(image) || !IMAGE_TYPES.includes(image.mimeType) || typeof image.data !== 'string') {
+    throw new RequestError('"image" must be { mimeType: image/jpeg|png|webp, data: base64 }.')
+  }
+  const data = image.data.replace(/^data:[^;]+;base64,/, '')
+  if (!/^[A-Za-z0-9+/]+=*$/.test(data)) throw new RequestError('"image.data" must be base64.')
+  if (Math.floor((data.length * 3) / 4) > MAX_IMAGE_BYTES) throw new RequestError('The photo is too large.')
+  return { mimeType: image.mimeType, data }
+}
+
+// Accepts { messages: [{ role: 'user'|'assistant', text, image? }], context, language? }; throws RequestError when malformed.
+// Only the last (user) message may carry an image.
 // language: 'en' | 'uz'; any other value becomes 'en'.
 export function parseChatBody(body) {
   if (!isObject(body)) throw new RequestError('Body must be a JSON object.')
@@ -114,8 +151,12 @@ export function parseChatBody(body) {
     }
     return { role: message.role, text: message.text.slice(0, MAX_MESSAGE_CHARS) }
   })
-  if (cleaned[cleaned.length - 1].role !== 'user') throw new RequestError('The last message must come from the user.')
-  if (!cleaned[cleaned.length - 1].text.trim()) throw new RequestError('The message is empty.')
+  const last = cleaned[cleaned.length - 1]
+  if (last.role !== 'user') throw new RequestError('The last message must come from the user.')
+  const image = parseImage(messages[messages.length - 1].image)
+  if (image) last.image = image
+  if (!last.text.trim() && !image) throw new RequestError('The message is empty.')
+  if (!last.text.trim()) last.text = 'Read this photo and add what is on it to my plan.'
   return { messages: cleaned, context, language: normalizeLanguage(language) }
 }
 
@@ -128,7 +169,9 @@ export function buildChatRequest({ messages, context, language = 'en' }) {
     },
     contents: messages.slice(firstUser).map((message) => ({
       role: message.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: message.text }],
+      parts: message.image
+        ? [{ inlineData: { mimeType: message.image.mimeType, data: message.image.data } }, { text: message.text }]
+        : [{ text: message.text }],
     })),
     generationConfig: {
       responseMimeType: 'application/json',
@@ -143,6 +186,14 @@ function sanitizeTask(task) {
   const title = cleanText(task.title, 120)
   if (!title || !isDate(task.date) || !isTime(task.startTime) || !isTime(task.endTime) || task.endTime <= task.startTime) return null
   return { title, date: task.date, startTime: task.startTime, endTime: task.endTime, priority: PRIORITIES.includes(task.priority) ? task.priority : 'Medium' }
+}
+
+function sanitizeScheduleBlock(block) {
+  if (!isObject(block)) return null
+  const title = cleanText(block.title, 120)
+  const dayOfWeek = DAY_NAMES.indexOf(block.day)
+  if (!title || dayOfWeek === -1 || !isTime(block.startTime) || !isTime(block.endTime) || block.endTime <= block.startTime) return null
+  return { title, dayOfWeek, startTime: block.startTime, endTime: block.endTime, type: SCHEDULE_TYPES.includes(block.type) ? block.type : 'Personal' }
 }
 
 function sanitizeGoal(goal) {
@@ -186,6 +237,9 @@ export function sanitizeChatAnswer(raw) {
     if (action.type === 'addTask') {
       const task = sanitizeTask(action.task)
       if (task) actions.push({ type: 'addTask', summary: summary || `Add task: ${task.title}`, task })
+    } else if (action.type === 'addScheduleBlock') {
+      const scheduleBlock = sanitizeScheduleBlock(action.scheduleBlock)
+      if (scheduleBlock) actions.push({ type: 'addScheduleBlock', summary: summary || `Add to schedule: ${scheduleBlock.title}`, scheduleBlock })
     } else if (action.type === 'addGoal') {
       const goal = sanitizeGoal(action.goal)
       if (goal) actions.push({ type: 'addGoal', summary: summary || `Add goal: ${goal.title}`, goal })

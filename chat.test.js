@@ -97,7 +97,7 @@ describe('sanitizeChatAnswer', () => {
 
   it(`caps proposals at ${MAX_ACTIONS}`, () => {
     const task = { title: 'T', date: '2026-09-24', startTime: '10:00', endTime: '11:00', priority: 'Low' }
-    const clean = sanitizeChatAnswer({ reply: 'ok', actions: Array.from({ length: 9 }, () => ({ type: 'addTask', summary: 's', task })) })
+    const clean = sanitizeChatAnswer({ reply: 'ok', actions: Array.from({ length: MAX_ACTIONS + 4 }, () => ({ type: 'addTask', summary: 's', task })) })
     expect(clean.actions).toHaveLength(MAX_ACTIONS)
   })
 
@@ -118,5 +118,56 @@ describe('chat', () => {
   it('wraps bad answers in AIProviderError', async () => {
     const client = fakeClient(geminiAnswer({ nope: true }))
     await expect(chat(client, parseChatBody({ context, messages: [{ role: 'user', text: 'hello' }] }))).rejects.toBeInstanceOf(AIProviderError)
+  })
+})
+
+describe('photos', () => {
+  const tinyJpeg = Buffer.from('fake-jpeg-bytes').toString('base64')
+
+  it('attaches a photo on the last user message as inlineData, before the text', () => {
+    const input = parseChatBody({ context, messages: [{ role: 'user', text: 'mana jadvalim', image: { mimeType: 'image/jpeg', data: `data:image/jpeg;base64,${tinyJpeg}` } }] })
+    const request = buildChatRequest(input)
+    expect(request.contents.at(-1).parts).toEqual([{ inlineData: { mimeType: 'image/jpeg', data: tinyJpeg } }, { text: 'mana jadvalim' }])
+  })
+
+  it('accepts a photo without text and fills in a default instruction', () => {
+    const input = parseChatBody({ context, messages: [{ role: 'user', text: '', image: { mimeType: 'image/png', data: tinyJpeg } }] })
+    expect(input.messages.at(-1).text).toMatch(/photo/)
+  })
+
+  it('rejects other file types, non-base64 data and oversized photos', () => {
+    const send = (image) => () => parseChatBody({ context, messages: [{ role: 'user', text: 'x', image }] })
+    expect(send({ mimeType: 'application/pdf', data: tinyJpeg })).toThrow(RequestError)
+    expect(send({ mimeType: 'image/jpeg', data: 'not base64 !!' })).toThrow(RequestError)
+    expect(send({ mimeType: 'image/jpeg', data: 'A'.repeat(8 * 1024 * 1024) })).toThrow(/too large/)
+  })
+
+  it('tells the model how to read photos', () => {
+    expect(CHAT_SYSTEM_PROMPT).toMatch(/PHOTOS/)
+    expect(CHAT_SYSTEM_PROMPT).toMatch(/addScheduleBlock/)
+  })
+})
+
+describe('addScheduleBlock', () => {
+  it('turns a day name into dayOfWeek and drops broken blocks', () => {
+    const clean = sanitizeChatAnswer({
+      reply: 'ok',
+      actions: [
+        { type: 'addScheduleBlock', summary: 'Korean 1', scheduleBlock: { title: 'Korean 1 (광108A)', day: 'Tuesday', startTime: '09:00', endTime: '10:30', type: 'University' } },
+        { type: 'addScheduleBlock', summary: 'bad day', scheduleBlock: { title: 'X', day: 'Funday', startTime: '09:00', endTime: '10:00', type: 'Class' } },
+        { type: 'addScheduleBlock', summary: 'bad time', scheduleBlock: { title: 'X', day: 'Monday', startTime: '11:00', endTime: '10:00', type: 'Class' } },
+        { type: 'addScheduleBlock', summary: 'odd type', scheduleBlock: { title: 'Gym', day: 'Sunday', startTime: '08:00', endTime: '09:00', type: 'Hobby' } },
+      ],
+    })
+    expect(clean.actions).toEqual([
+      { type: 'addScheduleBlock', summary: 'Korean 1', scheduleBlock: { title: 'Korean 1 (광108A)', dayOfWeek: 1, startTime: '09:00', endTime: '10:30', type: 'University' } },
+      { type: 'addScheduleBlock', summary: 'odd type', scheduleBlock: { title: 'Gym', dayOfWeek: 6, startTime: '08:00', endTime: '09:00', type: 'Personal' } },
+    ])
+  })
+
+  it('is part of the response schema', () => {
+    const item = CHAT_SCHEMA.properties.actions.items
+    expect(item.properties.type.enum).toContain('addScheduleBlock')
+    expect(item.properties.scheduleBlock.properties.day.enum).toHaveLength(7)
   })
 })

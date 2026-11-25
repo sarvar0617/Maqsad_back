@@ -82,6 +82,8 @@ app.use('/api/auth', rateLimit({ limit: AUTH_RATE_LIMIT }))
 app.use('/api/planner', rateLimit({ limit: 120 }))
 // A full planner document (months of routines) is bigger than the other bodies.
 app.use('/api/planner', express.json({ limit: '2mb' }))
+// The coach may receive a photo (scaled down by the app to well under 5 MB as base64).
+app.use('/api/ai/chat', express.json({ limit: '8mb' }))
 app.use(express.json({ limit: '200kb' }))
 
 app.get('/api/health', async (_req, res) => {
