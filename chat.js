@@ -257,8 +257,12 @@ export function sanitizeChatAnswer(raw) {
   return { reply, actions }
 }
 
+// Reading a photo takes the model longer than a text reply (the app waits up to 90 s, so three models × 28 s still fit).
+export const PHOTO_TIMEOUT_MS = 28_000
+
 export async function chat(client, input, { model = DEFAULT_MODEL } = {}) {
-  const data = await client.generate(model, buildChatRequest(input))
+  const hasPhoto = Boolean(input.messages.at(-1)?.image)
+  const data = await client.generate(model, buildChatRequest(input), hasPhoto ? { timeoutMs: PHOTO_TIMEOUT_MS } : undefined)
   const parsed = readJsonAnswer(data)
   try {
     return { ...sanitizeChatAnswer(parsed), model: data.modelVersion || model }

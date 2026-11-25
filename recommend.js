@@ -172,10 +172,10 @@ function classifyHttpError(status, body) {
   return new AIProviderError('upstream', `Gemini error (${status}): ${message}`, status)
 }
 
-// A tiny client: generate(model, body) -> parsed JSON response. fetchImpl is injectable for tests.
-export function createClient(apiKey, { fetchImpl = globalThis.fetch, timeoutMs = DEFAULT_TIMEOUT_MS, baseUrl = GEMINI_BASE_URL } = {}) {
+// A tiny client: generate(model, body, { timeoutMs? }) -> parsed JSON response. fetchImpl is injectable for tests.
+export function createClient(apiKey, { fetchImpl = globalThis.fetch, timeoutMs: defaultTimeoutMs = DEFAULT_TIMEOUT_MS, baseUrl = GEMINI_BASE_URL } = {}) {
   return {
-    async generate(model, body) {
+    async generate(model, body, { timeoutMs = defaultTimeoutMs } = {}) {
       let response
       try {
         response = await fetchImpl(`${baseUrl}/models/${encodeURIComponent(model)}:generateContent`, {
