@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { OAuth2Client } from 'google-auth-library'
+import { createActivityTracker, createAdminHandlers, parseAdminEmails } from './admin.js'
 import { createAuthHandlers, createPgUserStore, createUserStore, loadSecret, requireVerified } from './auth.js'
 import { createMailer, verificationEmail } from './mailer.js'
 import { cors, parseOrigins, rateLimit } from './middleware.js'
@@ -42,9 +43,12 @@ const mailer = createMailer({ apiKey: process.env.RESEND_API_KEY?.trim(), from: 
 const APP_URL = process.env.APP_URL?.trim() || 'http://localhost:5173'
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID?.trim()
 const google = GOOGLE_CLIENT_ID ? { verifier: new OAuth2Client(GOOGLE_CLIENT_ID), clientId: GOOGLE_CLIENT_ID } : null
-const authHandlers = createAuthHandlers({ store: userStore, secret: authSecret, mailer, appUrl: APP_URL, google, emailTemplate: verificationEmail })
+// Usage statistics: each logged-in request marks the user active today; the owner reads them at /api/admin/stats.
+const trackActivity = createActivityTracker(userStore)
+const adminHandlers = createAdminHandlers({ store: userStore, secret: authSecret, adminEmails: parseAdminEmails(process.env.ADMIN_EMAILS) })
+const authHandlers = createAuthHandlers({ store: userStore, secret: authSecret, mailer, appUrl: APP_URL, google, emailTemplate: verificationEmail, onActivity: trackActivity })
 // AI and cross-device sync are for confirmed accounts only.
-const verifiedOnly = requireVerified({ store: userStore, secret: authSecret })
+const verifiedOnly = requireVerified({ store: userStore, secret: authSecret, onActivity: trackActivity })
 // Planner data synced between a user's devices; same storage choice as accounts.
 const plannerStore = pool ? createPgPlannerStore(pool, { ready: () => userStore.init() }) : createPlannerStore(join(dataDir, 'planner.json'))
 const plannerHandlers = createPlannerHandlers({ store: plannerStore, users: userStore, secret: authSecret })
@@ -80,6 +84,7 @@ app.use(cors(ORIGINS))
 app.use('/api/ai', rateLimit({ limit: RATE_LIMIT }))
 app.use('/api/auth', rateLimit({ limit: AUTH_RATE_LIMIT }))
 app.use('/api/planner', rateLimit({ limit: 120 }))
+app.use('/api/admin', rateLimit({ limit: 30 }))
 // A full planner document (months of routines) is bigger than the other bodies.
 app.use('/api/planner', express.json({ limit: '2mb' }))
 // The coach may receive a photo (scaled down by the app to well under 5 MB as base64).
@@ -98,6 +103,8 @@ app.get('/api/auth/me', authHandlers.me)
 app.post('/api/auth/google', authHandlers.google)
 app.post('/api/auth/verify-email', authHandlers.verifyEmail)
 app.post('/api/auth/resend-verification', authHandlers.resendVerification)
+
+app.get('/api/admin/stats', adminHandlers.stats)
 
 app.get('/api/planner', verifiedOnly, plannerHandlers.get)
 app.put('/api/planner', verifiedOnly, plannerHandlers.put)

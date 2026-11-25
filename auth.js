@@ -120,6 +120,21 @@ export function createUserStore(file) {
       users.set(user.email, { emailVerified: false, googleSub: null, ...user })
       persist()
     },
+    // Records a visit on `day` (YYYY-MM-DD) for the usage statistics.
+    touch(id, day) {
+      const user = [...users.values()].find((entry) => entry.id === id)
+      if (!user) return
+      user.lastSeenAt = new Date().toISOString()
+      user.activeDays = [...new Set([...(user.activeDays ?? []), day])].slice(-60)
+      persist()
+    },
+    statsData({ sinceDay }) {
+      const list = [...users.values()]
+      return {
+        users: list.map((user) => ({ id: user.id, name: user.name, email: user.email, emailVerified: Boolean(user.emailVerified), google: Boolean(user.googleSub), hasPassword: Boolean(user.passwordHash), createdAt: user.createdAt, lastSeenAt: user.lastSeenAt ?? null })),
+        activity: list.flatMap((user) => (user.activeDays ?? []).filter((day) => day >= sinceDay).map((day) => ({ userId: user.id, day }))),
+      }
+    },
     // patch: { emailVerified?, googleSub? }
     update(id, patch) {
       const user = [...users.values()].find((entry) => entry.id === id)
@@ -158,6 +173,12 @@ export function createPgUserStore(pool) {
       ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub text UNIQUE;
       ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
       ALTER TABLE users ALTER COLUMN age DROP NOT NULL;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+      CREATE TABLE IF NOT EXISTS user_activity (
+        user_id text NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        day date NOT NULL,
+        PRIMARY KEY (user_id, day)
+      );
     `)).catch((error) => {
       ready = undefined // retry on the next request instead of failing forever
       throw error
@@ -180,6 +201,23 @@ export function createPgUserStore(pool) {
       await init()
       const { rows } = await pool.query('SELECT * FROM users WHERE google_sub = $1', [sub])
       return toUser(rows[0]) ?? null
+    },
+    // Records a visit on `day` (YYYY-MM-DD, already in the statistics time zone).
+    async touch(id, day) {
+      await init()
+      await pool.query('UPDATE users SET last_seen_at = now() WHERE id = $1', [id])
+      await pool.query('INSERT INTO user_activity (user_id, day) VALUES ($1, $2) ON CONFLICT DO NOTHING', [id, day])
+    },
+    async statsData({ sinceDay }) {
+      await init()
+      const [{ rows: userRows }, { rows: activityRows }] = await Promise.all([
+        pool.query('SELECT id, name, email, email_verified, google_sub IS NOT NULL AS google, password_hash IS NOT NULL AS has_password, created_at, last_seen_at FROM users'),
+        pool.query("SELECT user_id, to_char(day, 'YYYY-MM-DD') AS day FROM user_activity WHERE day >= $1::date", [sinceDay]),
+      ])
+      return {
+        users: userRows.map((row) => ({ id: row.id, name: row.name, email: row.email, emailVerified: row.email_verified, google: row.google, hasPassword: row.has_password, createdAt: row.created_at.toISOString(), lastSeenAt: row.last_seen_at?.toISOString() ?? null })),
+        activity: activityRows.map((row) => ({ userId: row.user_id, day: row.day })),
+      }
     },
     async update(id, { emailVerified, googleSub }) {
       await init()
@@ -219,12 +257,14 @@ export const publicUser = ({ id, name, age, email, emailVerified, googleSub, pas
 const bearer = (req) => /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1]
 
 // Middleware: lets the request through only for a logged-in user whose e-mail is confirmed (req.user is set).
-export function requireVerified({ store, secret }) {
+// `onActivity(userId)` (optional) is told about every authenticated request, for the usage statistics.
+export function requireVerified({ store, secret, onActivity = () => {} }) {
   return async (req, res, next) => {
     try {
       const userId = verifyToken(bearer(req), secret)
       const user = userId && await store.findById(userId)
       if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Please log in again.' })
+      onActivity(user.id)
       if (!user.emailVerified) return res.status(403).json({ error: 'email_not_verified', message: 'Confirm your email address first.' })
       req.user = user
       next()
@@ -265,7 +305,7 @@ export function loadSecret(envSecret, file) {
 // Express handlers: { signup, login, me, google, verifyEmail, resendVerification }.
 // mailer: from mailer.js; appUrl: the site the confirmation link opens (e.g. https://maqsadai.uz);
 // google: { verifier, clientId } or null when Google sign-in is not configured.
-export function createAuthHandlers({ store, secret, mailer = null, appUrl = 'http://localhost:5173', google = null, emailTemplate = ({ link }) => ({ subject: 'Confirm your email', text: link, html: link }), now = Date.now }) {
+export function createAuthHandlers({ store, secret, mailer = null, appUrl = 'http://localhost:5173', google = null, emailTemplate = ({ link }) => ({ subject: 'Confirm your email', text: link, html: link }), now = Date.now, onActivity = () => {} }) {
   const lastSent = new Map() // userId -> time of the last confirmation e-mail, to stop resend spam
 
   async function sendVerification(user) {
@@ -281,7 +321,10 @@ export function createAuthHandlers({ store, secret, mailer = null, appUrl = 'htt
     }
   }
 
-  const respond = (res, user, status = 200) => res.status(status).json({ token: createToken(user.id, secret), user: publicUser(user) })
+  const respond = (res, user, status = 200) => {
+    onActivity(user.id)
+    return res.status(status).json({ token: createToken(user.id, secret), user: publicUser(user) })
+  }
   const sendError = (res, error) => {
     if (error instanceof RequestError) return res.status(error.status).json({ error: error.code ?? 'bad_request', message: error.message })
     console.error('[auth] failed:', error)
@@ -296,6 +339,7 @@ export function createAuthHandlers({ store, secret, mailer = null, appUrl = 'htt
         const user = { id: randomBytes(12).toString('hex'), name: input.name, age: input.age, email: input.email, passwordHash: await hashPassword(input.password), emailVerified: false, googleSub: null, createdAt: new Date().toISOString() }
         await store.add(user)
         const emailSent = await sendVerification(user)
+        onActivity(user.id)
         res.status(201).json({ token: createToken(user.id, secret), user: publicUser(user), emailSent })
       } catch (error) {
         sendError(res, error)
@@ -320,6 +364,7 @@ export function createAuthHandlers({ store, secret, mailer = null, appUrl = 'htt
         const userId = verifyToken(bearer(req), secret)
         const user = userId && await store.findById(userId)
         if (!user) return res.status(401).json({ error: 'unauthorized', message: 'Please log in again.' })
+        onActivity(user.id)
         res.json({ user: publicUser(user) })
       } catch (error) {
         sendError(res, error)
